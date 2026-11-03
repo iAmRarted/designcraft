@@ -13,6 +13,10 @@
 DesignCraft aims at full Adobe InDesign parity — and to be better: faster, open (documented JSON format + IDML), scriptable by agents (MCP), and available on the web.
 
 - **2026-10-30** · Document Fonts lookup treats a bare document filename's empty parent as the current directory (#2014), preserving case-insensitive discovery and automation read-root checks. No readiness percentage change.
+- **2026-10-27** · The Pages panel draws page and parent thumbnails on a background thread, only
+  for the rows on screen, and keeps the previous revision's picture until the new one arrives. On
+  a 190-page catalogue switching to the Pages tab went from 43 s to 0.2 s, and editing no longer
+  froze the window for over a minute. No readiness percentage change.
 - **2026-10-30** · The installed CJK/Indic interface fallback faces are read on a `ui-fonts`
   thread instead of the first frame: the window draws with the built-in faces at once, and the
   existing retry installs the rest when they arrive (47 MB of font files on the reporting machine).
