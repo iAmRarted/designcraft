@@ -466,6 +466,8 @@ pub(crate) fn discard_document(s: &mut Session, index: usize, default_dir: Optio
     // A completed Save/Close/Revert consumes the provenance, even when removal fails. A stale
     // source uid must never become a future claim on another document's checkpoint.
     let mut entries = std::mem::take(&mut doc.recovery_entries);
+    // The checkpoints are going away, so what they held goes with them.
+    doc.recovery_revisions.clear();
     if let Some(dir) = default_dir
         && !entries.iter().any(|(entry_dir, entry_uid)| *entry_uid == uid && same_directory(entry_dir, dir))
     {
@@ -493,6 +495,35 @@ fn same_directory(a: &Path, b: &Path) -> bool {
 
 fn has_checkpoint(doc: &DocState, dir: &Path) -> bool {
     doc.recovery_entries.iter().any(|(entry_dir, uid)| *uid == doc.uid && same_directory(entry_dir, dir))
+}
+
+/// Whether the checkpoint already in `dir` holds this document as it is now, so rewriting it would
+/// produce the same bytes. Recorded per folder: a checkpoint in one folder says nothing about
+/// another's.
+fn checkpoint_is_current(doc: &DocState, dir: &Path) -> bool {
+    // The record only says what was written; the files must still be there. Something outside
+    // this run (a cleanup, the user) may have removed them, and a skipped write would then leave
+    // the unsaved document with nothing to recover from.
+    let (document, metadata) = files(dir, doc.uid);
+    has_checkpoint(doc, dir)
+        && doc.recovery_revisions.iter().any(|(entry_dir, revision)| *revision == doc.revision && same_directory(entry_dir, dir))
+        && document.is_file()
+        && metadata.is_file()
+}
+
+/// Record that `dir`'s checkpoint now holds the document's current revision.
+fn record_checkpoint_revision(doc: &mut DocState, dir: &Path) {
+    let revision = doc.revision;
+    record_checkpoint_revision_at(doc, dir, revision);
+}
+
+/// Record that `dir`'s checkpoint holds the document as it was at `revision` (a background write
+/// records the revision it snapshotted, which edits made while it ran have since moved past).
+fn record_checkpoint_revision_at(doc: &mut DocState, dir: &Path, revision: u64) {
+    match doc.recovery_revisions.iter_mut().find(|(entry_dir, _)| same_directory(entry_dir, dir)) {
+        Some(entry) => entry.1 = revision,
+        None => doc.recovery_revisions.push((dir.to_path_buf(), revision)),
+    }
 }
 
 fn protect_retained_sources(s: &Session, dir: &Path) -> Result<()> {
@@ -556,6 +587,11 @@ pub(crate) fn save_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
             discard_document(s, index, Some(dir));
             continue;
         }
+        // A document nobody has touched since its last checkpoint here is already on disk: do not
+        // serialize the whole file (every placed image included) again.
+        if s.docs.get(index).is_some_and(|document| checkpoint_is_current(document, dir)) {
+            continue;
+        }
         let Some(document) = s.docs.get(index) else { continue };
         let entry = Snapshot::of(&access, dir, document);
         let written = write_snapshot(&entry, || false);
@@ -563,9 +599,14 @@ pub(crate) fn save_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
         // returning a metadata error, so Save and Close remove the snapshot this run wrote.
         if written.published
             && let Some(document) = s.docs.get_mut(index)
-            && !has_checkpoint(document, dir)
         {
-            document.recovery_entries.push((dir.to_path_buf(), document.uid));
+            if !has_checkpoint(document, dir) {
+                document.recovery_entries.push((dir.to_path_buf(), document.uid));
+            }
+            // Only a complete checkpoint (metadata too) lets the next tick skip the write.
+            if written.error.is_none() {
+                record_checkpoint_revision_at(document, dir, entry.revision);
+            }
         }
         if let Some(e) = written.error {
             return Err(e);
@@ -600,6 +641,9 @@ struct Snapshot {
     own: bool,
     /// The folder's canonical key, for recording that a shared entry is this run's now.
     key: PathBuf,
+    /// The document revision this snapshot holds, recorded once it is on disk so an untouched
+    /// document is not written again.
+    revision: u64,
 }
 
 impl Snapshot {
@@ -607,6 +651,7 @@ impl Snapshot {
         Snapshot {
             dir: dir.to_path_buf(),
             uid: d.uid,
+            revision: d.revision,
             doc: d.preview_stash.clone().unwrap_or_else(|| d.doc.clone()),
             path: d.path.clone(),
             title: d.title(),
@@ -677,6 +722,11 @@ pub(crate) fn start_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
                 discard_document(s, index, Some(dir));
                 continue;
             }
+            // A document nobody has touched since its last checkpoint here is already on disk:
+            // do not serialize the whole file (every placed image included) again.
+            if s.docs.get(index).is_some_and(|document| checkpoint_is_current(document, dir)) {
+                continue;
+            }
             let Some(document) = s.docs.get(index) else { continue };
             let entry = Snapshot::of(&access, dir, document);
             // A write still running for this document already holds a snapshot of it; the next
@@ -686,9 +736,11 @@ pub(crate) fn start_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
                 Some(false) => {}
                 None => {
                     // No thread: write this one here rather than lose the recovery data.
-                    let written = write_snapshot(&Snapshot::of(&access, dir, document), || false);
+                    let entry = Snapshot::of(&access, dir, document);
+                    let written = write_snapshot(&entry, || false);
                     if written.published {
-                        record_checkpoint(s, dir.to_path_buf(), document.uid);
+                        let complete = written.error.is_none().then_some(entry.revision);
+                        record_checkpoint(s, dir.to_path_buf(), entry.uid, complete);
                     }
                     if let Some(e) = written.error {
                         return Err(e);
@@ -703,11 +755,15 @@ pub(crate) fn start_tracked(s: &mut Session, dir: &Path) -> Result<usize> {
 
 /// Apply one finished background write: record the checkpoint of a document still open and
 /// unsaved, or drop the snapshot of one saved, reverted or closed while its write ran. Returns
-/// whether a checkpoint was recorded.
+/// whether a checkpoint was recorded. `complete` is the revision written when its metadata landed
+/// too, so the next tick can skip a document untouched since.
 #[cfg(not(target_arch = "wasm32"))]
-fn record_checkpoint(s: &mut Session, dir: PathBuf, uid: u64) -> bool {
+fn record_checkpoint(s: &mut Session, dir: PathBuf, uid: u64, complete: Option<u64>) -> bool {
     match s.docs.iter_mut().find(|doc| doc.uid == uid) {
         Some(doc) if doc.is_dirty() => {
+            if let Some(revision) = complete {
+                record_checkpoint_revision_at(doc, &dir, revision);
+            }
             if !has_checkpoint(doc, &dir) {
                 doc.recovery_entries.push((dir, uid));
             }
@@ -741,7 +797,8 @@ pub(crate) fn finished(s: &mut Session) -> Finished {
     while let Ok(d) = done.try_recv() {
         // A primary that landed belongs to this run even if its optional metadata failed: record
         // it, so Save and Close remove the snapshot instead of leaving it in the folder for ever.
-        if d.published && record_checkpoint(s, d.dir, d.uid) {
+        let complete = d.error.is_none().then_some(d.revision);
+        if d.published && record_checkpoint(s, d.dir, d.uid, complete) {
             out.written += 1;
         }
         if let Some(e) = d.error {
@@ -778,6 +835,8 @@ mod worker {
         /// The primary document reached the folder (its optional metadata may have failed): the
         /// checkpoint must still be recorded, or Save and Close could not remove it.
         pub(super) published: bool,
+        /// The document revision the snapshot held.
+        pub(super) revision: u64,
     }
 
     pub(super) struct Writer {
@@ -834,11 +893,11 @@ mod worker {
                 let spawned = std::thread::Builder::new().name("designcraft-recovery".into()).spawn(move || {
                     while let Ok(job) = job_rx.recv() {
                         let (published, error) = guarded_write(&job);
-                        let (dir, uid) = (job.dir, job.uid);
+                        let (dir, uid, revision) = (job.dir, job.uid, job.revision);
                         // The result before the document reads as idle: a writer that is not busy
                         // has already delivered it, so the interface never stops polling with an
                         // answer still on its way.
-                        let sent = done_tx.send(Done { dir: dir.clone(), uid, error, published }).is_ok();
+                        let sent = done_tx.send(Done { dir: dir.clone(), uid, error, published, revision }).is_ok();
                         if let Some(w) = WRITER.get().and_then(Option::as_ref) {
                             w.finish(&dir, uid);
                         }
@@ -1206,6 +1265,10 @@ fn open_with_publisher(s: &mut Session, dir: &Path, mut publish: impl FnMut(&Pat
                         Ok(()) => {
                             discard(dir, uid);
                             state.recovery_entries = vec![(destination.clone(), state.uid)];
+                            // Both files written from this very document: the next tick has
+                            // nothing to redo. Not recorded when the metadata failed, so that tick
+                            // writes the entry again rather than leaving it without its path.
+                            record_checkpoint_revision(state, &destination);
                         }
                         Err(e) => log::warn!("recovery entry {uid} kept: {e}"),
                     }
